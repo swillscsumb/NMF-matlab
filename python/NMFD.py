@@ -1,115 +1,152 @@
+import warnings
+
 import numpy as np
-import sys
-from scipy.ndimage.filters import convolve1d
 
-def NMFD(V, R=3 ,T=10, n_iter=50, init_W=[], init_H=[]):
+class NMFD(object):
     """
-     NMFD(V, R=3 ,T=10, n_iter=50, init_W=None, init_H=None)
-        NMFD as proposed by Smaragdis (Non-negative Matrix Factor
-        Deconvolution; Extraction of Multiple Sound Sources from Monophonic
-        Inputs). KL divergence minimization. The proposed algorithm was
-        corrected.
-    Input :
-       - V : magnitude spectrogram to factorize (is a FxN numpy array)
-       - R : number of templates (unused if init_W or init_H is set)
-       - T : template size (in number of frames in the spectrogram) (unused if init_W is set)
-       - n_iter : number of iterations
-       - init_W : initial value for W.
-       - init_H : initial value for H.
-    Output :
-       - W : time/frequency template (FxRxT array, each template is TxF)
-       - H : activities for each template (RxN array)
-
-     Copyright (C) 2015 Romain Hennequin
     """
+    MU = 0
+    EPS = np.spacing(1)
+    DEBUG = True
+    ITERFMT = 'Computing NMFD. iteration : {0:d}/{1:d}'
 
-    """
-     V : spectrogram FxN
-     H : activation RxN
-     Wt : spectral template FxR t = 0 to T-1
-     W : FxRxT
-    """
-    eps = np.spacing(1)
+    def __init__(self, v, r=3, t=10, i=50, w=None, h=None):
+        """
+        """
+	# input spectrogram or scalogram
+        self.v = v
+	# data size
+        self.m, self.n = self.v.shape
+	# number of templates
+        self.r = r
+	# template size
+        self.t = t
+	# number or iterations
+        self.i = i
 
-    # data size
-    F = V.shape[0];
-    N = V.shape[1];
+	# bases
+        if w is not None:
+            self.w = w
+            self.r = self.w.shape[1]
+            self.t = self.w.shape[2]
+        else:
+            self.w = np.random.rand(self.m, self.r, self.t)
 
-    # initialization
-    if len(init_H):
-        H = init_H
-        R = H.shape[0]
-    else:
-        H = np.random.rand(R,N);
+	# weights
+        if h is not None:
+            self.h = h
+            self.r = self.h.shape[0]
+        else:
+            self.h = np.random.rand(self.r, self.n)
 
-    if len(init_W):
-        W = init_W
-        R = W.shape[1]
-        T = W.shape[2]
-    else:
-        W = np.random.rand(F,R,T);
+        self.one = np.ones((self.m, self.n))
+        self._lambda = np.zeros((self.m, self.n))
+        self._vonlambda = None
+        self.cost = np.zeros(self.i)
 
-    One = np.ones((F,N));
-    Lambda = np.zeros((F,N));
+        self.constraint = 1.02**np.arange(0, self.t) - 1.0
+        self.constraint[0:2] = 0.0
 
-    cost = np.zeros(n_iter)
-    for it in range(n_iter):
-        sys.stdout.write('Computing NMFD. iteration : %d/%d' % (it+1, n_iter));
-        sys.stdout.write('\r')
-        sys.stdout.flush()
+    def compute_lambda(self):
+        """
+        computation of Lambda
+        """
+        self._lambda[:] = 0.0
+        for m in xrange(self.m):
+            for r in xrange(self.r):
+                cv = np.convolve(self.w[m, r, :], self.h[r, :])
+                self._lambda[m, :] += cv[0:self._lambda.shape[1]]
 
-        # computation of Lambda
-        Lambda[:] = 0;
-        for f in range(F):
-            for z in range(R):
-                cv = np.convolve(W[f,z,:],H[z,:]);
-                Lambda[f,:] = Lambda[f,:] + cv[0:Lambda.shape[1]];
+        self._vonlambda = self.v/(self._lambda + self.EPS)
 
-        Halt = H.copy();
+    def cost_iter(self, i):
+        """
+        """
+        self.cost[i] = (self.v*np.log(self.v/self._lambda) - self.v
+                        + self._lambda).sum()
 
-        Htu = np.zeros((T,R,N));
-        Htd = np.zeros((T,R,N));
+    def row_shift(self, a, t):
+        shift_a = np.roll(a, -t).T
+        if t > 0:
+            shift_a[-t:, :] = 0.0
+        return shift_a
 
-        # update of H for each value of t (which will be averaged)
-        VonLambda = V/(Lambda + eps);
-
-        cost[it] = (V*log(V/Lambda)-V+Lambda).sum()
-
-        Hu = np.zeros((R,N));
-        Hd = np.zeros((R,N));
-        for z in range(R):
-            for f in range(F):
-                cv = np.convolve(VonLambda[f,:],np.flipud(W[f,z,:]));
-                Hu[z,:] = Hu[z,:] + cv[T-1:T+N-1];
-                cv = np.convolve(One[f,:],np.flipud(W[f,z,:]));
-                Hd[z,:] = Hd[z,:] + cv[T-1:T+N-1];
+    def avg_h(self):
+        """
+        average along t
+        """
+        hu = np.zeros((self.r, self.n))
+        hd = np.zeros((self.r, self.n))
+        for r in xrange(self.r):
+            for m in xrange(self.m):
+                cv = np.convolve(self._vonlambda[m, :],
+                                 np.flipud(self.w[m, r, :]))
+                hu[r, :] += cv[self.t-1:self.t+self.n-1]
+                cv = np.convolve(self.one[m, :], np.flipud(self.w[m, r, :]))
+                hd[r, :] += cv[self.t-1:self.t+self.n-1]
 
         # average along t
-        H = H*Hu/Hd;
+        self.h *= hu/hd
 
-        # computation of Lambda
+    def update_wt(self):
+        """
+        update of Wt
+        """
+        for t in xrange(self.t):
+            shift_h = self.row_shift(self.h, t)
+            self.w[:, :, t] *= (np.dot(self._vonlambda, shift_h) /
+                                (np.dot(self.one, shift_h) + self.EPS
+                                 + self.MU * self.constraint[t]))
 
-        Lambda[:] = 0;
-        for f in range(F):
-            for z in range(R):
-                cv = np.convolve(W[f,z,:],H[z,:])
-                Lambda[f,:] += cv[0:Lambda.shape[1]]
+    def nmfd_iter(self, i):
+        """
+        nmfd iterator
+        """
+        # update of H for each value of t (which will be averaged)
+        self.compute_lambda()
+        self.cost_iter(i)
+        self.avg_h()
+        self.compute_lambda()
+        self.update_wt()
 
-        mu = 0
-        constraint = 1.02**np.arange(0,T)-1
-        constraint[0:2] = 0
+    def nmfd(self):
+        """
+         NMFD(v, r=3, t=10, i=50, init_W=None, init_H=None)
+            NMFD as proposed by Smaragdis (Non-negative Matrix Factor
+            Deconvolution; Extraction of Multiple Sound Sources from Monophonic
+            Inputs). KL divergence minimization. The proposed algorithm was
+            corrected.
+        Input :
+           - v : array_like
+                magnitude spectrogram to factorize (is a MxN numpy array)
+           - r : int
+                number of templates (unused if init_W or init_H is set)
+           - t : int
+                template size (in number of frames in the spectrogram) (unused if
+                init_W is set)
+           - i :
+                number of iterations
+           - init_W :
+                initial value for W.
+           - init_H :
+                initial value for H.
+        Output :
+           - W : ndarray
+                time/frequency template (MxRxT array, each template is TxM)
+           - H : ndarry
+                activities for each template (RxN array)
 
-        SumTot = W.sum(axis=1)
+         Copyright (C) 2015 Romain Hennequin
 
-        VonLambda = V/(Lambda + eps)
+         v : spectrogram MxN
+         H : activation RxN
+         Wt : spectral template MxR t = 0 to T-1
+         W : MxRxT
+        """
 
+        for i in xrange(self.i):
+            if self.DEBUG:
+                warnings.warn(self.ITERFMT.format(i+1, self.i))
+            self.nmfd_iter(i)
 
-        # update of Wt
-        for t in range(T):
-            shift_H = np.roll(H,-t).T
-            if t>0:
-                shift_H[-t:,:]=0
-
-            W[:,:,t] = W[:,:,t] * (  np.dot(VonLambda,shift_H) / (np.dot(One,shift_H) + eps + mu * constraint[t])  );
-
-    return (W, H, cost)
+            return (self.w, self.h, self.cost)
